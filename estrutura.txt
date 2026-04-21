@@ -1,0 +1,20 @@
+formalizeai-premium/
+├── app.py                 # entrypoint Flask
+├── orchestrator.py        # pipeline de geração com retry
+├── validator.py           # validação de seções obrigatórias
+├── scorer.py              # pontuação de qualidade (0-18)
+├── storage.py             # persistência (Supabase + local)
+├── tasks.py               # Celery tasks
+├── auth.py                # JWT + API Key helpers
+├── config.py              # variáveis de ambiente
+├── templates/
+│   └── index.html         # mesmo fornecido (adaptado)
+├── static/
+│   └── swagger.json       # documentação OpenAPI (gerada manual)
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── nginx.conf
+├── .env.example
+└── tests/
+    └── test_app.py        # testes unitários básicos

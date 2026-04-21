@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  formalizeai:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - X_API_KEY=${X_API_KEY}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-llama-3.3-70b-versatile}
+      - QUALITY_THRESHOLD=${QUALITY_THRESHOLD:-12}
+      - MAX_ORCHESTRATION_CYCLES=${MAX_ORCHESTRATION_CYCLES:-3}
+      - RATE_LIMIT_REQUESTS=${RATE_LIMIT_REQUESTS:-60}
+      - RATE_LIMIT_PERIOD=${RATE_LIMIT_PERIOD:-60}
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
