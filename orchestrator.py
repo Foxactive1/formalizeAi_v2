@@ -1,5 +1,9 @@
+# orchestrator.py — FormalizeAI v4.1
+# FIX: substituído hash() nativo (não determinístico entre restarts) por sha256
+
 import json
 import logging
+from hashlib import sha256  # FIX: hash() é PYTHONHASHSEED-dependente; sha256 é determinístico
 from validator import Validator
 from scorer import Scorer
 from groq_client import generate_with_fallback
@@ -7,19 +11,20 @@ from config import QUALITY_THRESHOLD, REQUIRED_SECTIONS, MAX_ORCHESTRATION_CYCLE
 from cache import get_cache, set_cache
 from prompt_engine import PromptEngine
 
-log = logging.getLogger("formalizeai")
+log = logging.getLogger(\"formalizeai\")
 
 
 def _extract_sdd(text: str) -> str:
+    \"\"\"Remove a tag de controle [FINALIZANDO SDD] e retorna apenas o conteúdo.\"\"\"\
     if not text:
-        return ""
-    # Remove a tag de finalização se presente
-    if "[FINALIZANDO SDD]" in text:
-        text = text.split("[FINALIZANDO SDD]", 1)[1].strip()
+        return \"\"
+    if \"[FINALIZANDO SDD]\" in text:
+        text = text.split(\"[FINALIZANDO SDD]\", 1)[1].strip()
     return text
-    
+
+
 def _safe_json(data: dict) -> dict:
-    """Garante que o dicionário seja serializável para JSON."""
+    \"\"\"Garante que o dicionário seja serializável para JSON.\"\"\"\
     try:
         json.dumps(data)
         return data
@@ -34,6 +39,13 @@ def _safe_json(data: dict) -> dict:
         return clean
 
 
+def _cache_key(messages: list, model: str) -> str:
+    # FIX: usa sha256 (determinístico) em vez de hash() nativo do Python
+    # hash() muda a cada restart por causa do PYTHONHASHSEED aleatório do Python 3.3+
+    payload = json.dumps({\"messages\": messages[-5:], \"model\": model}, sort_keys=True)
+    return f\"orch:{sha256(payload.encode()).hexdigest()}\"
+
+
 class Orchestrator:
     MAX_CYCLES = MAX_ORCHESTRATION_CYCLES
 
@@ -42,29 +54,28 @@ class Orchestrator:
 
     def run(self, messages: list) -> dict:
         # Cache baseado nas últimas mensagens (evita reprocessamento idêntico)
-        cache_key = f"orch:{self.model}:{hash(json.dumps(messages[-5:], sort_keys=True))}"
+        cache_key = _cache_key(messages, self.model)
         cached = get_cache(cache_key)
         if cached:
-            log.info("Cache hit no Orchestrator")
+            log.info(\"Cache hit no Orchestrator\")
             return json.loads(cached)
 
-        sdd = ""
+        sdd = \"\"
         score = 0
-        validation = {"valid": False, "missing": REQUIRED_SECTIONS}
-        last_response = ""
+        validation = {\"valid\": False, \"missing\": REQUIRED_SECTIONS}
+        last_response = \"\"
 
         for cycle in range(1, self.MAX_CYCLES + 1):
-            log.info(f"Orchestrator: ciclo {cycle}/{self.MAX_CYCLES} — modelo preferido {self.model}")
+            log.info(f\"Orchestrator: ciclo {cycle}/{self.MAX_CYCLES} — modelo preferido {self.model}\")
 
-            # Usa fallback automático em caso de falha do modelo preferido
             try:
                 last_response = generate_with_fallback(messages, preferred_model=self.model)
             except RuntimeError as e:
-                log.error(f"Falha total na geração: {e}")
+                log.error(f\"Falha total na geração: {e}\")
                 return _safe_json({
-                    "status": "error",
-                    "message": str(e),
-                    "cycles": cycle,
+                    \"status\": \"error\",
+                    \"message\": str(e),
+                    \"cycles\": cycle,
                 })
 
             sdd = _extract_sdd(last_response)
@@ -72,39 +83,37 @@ class Orchestrator:
             score = Scorer.score(sdd)
 
             log.info(
-                f"Ciclo {cycle}: score={score}/{QUALITY_THRESHOLD} "
-                f"valid={validation['valid']} missing={len(validation['missing'])}"
+                f\"Ciclo {cycle}: score={score}/{QUALITY_THRESHOLD} \"
+                f\"valid={validation['valid']} missing={len(validation['missing'])}\"
             )
 
-            if validation["valid"] and score >= QUALITY_THRESHOLD:
-                result = {
-                    "response": last_response,
-                    "sdd": sdd,
-                    "score": score,
-                    "validation": validation,
-                    "status": "approved",
-                    "cycles": cycle,
-                }
+            if validation[\"valid\"] and score >= QUALITY_THRESHOLD:
+                result = _safe_json({
+                    \"status\": \"approved\",
+                    \"sdd\": sdd,
+                    \"score\": score,
+                    \"max_score\": Scorer.MAX_SCORE,
+                    \"cycles\": cycle,
+                    \"validation\": validation,
+                    \"breakdown\": Scorer.breakdown(sdd),
+                })
                 set_cache(cache_key, json.dumps(result))
-                return _safe_json(result)
+                return result
 
+            # Não atingiu o threshold: injeta prompt de correção para o próximo ciclo
             if cycle < self.MAX_CYCLES:
-                # Adiciona mensagem de correção para o próximo ciclo
-                messages = messages + [
-                    {"role": "assistant", "content": last_response},
-                    {"role": "user", "content": self._fix_prompt(validation, score)},
-                ]
+                fix_msg = PromptEngine.fix_prompt(validation, score, Scorer.MAX_SCORE)
+                messages = messages + [{\"role\": \"user\", \"content\": fix_msg}]
+                log.info(f\"Ciclo {cycle} insuficiente — injetando prompt de correção\")
 
-        result = {
-            "response": last_response,
-            "sdd": sdd,
-            "score": score,
-            "validation": validation,
-            "status": "needs_review",
-            "cycles": self.MAX_CYCLES,
-        }
-        return _safe_json(result)
-
-    def _fix_prompt(self, validation: dict, score: int) -> str:
-        """Gera prompt de correção usando PromptEngine."""
-        return PromptEngine.fix_prompt(validation, score, Scorer.MAX_SCORE)
+        # Esgotou os ciclos sem aprovação
+        return _safe_json({
+            \"status\": \"needs_review\",
+            \"sdd\": sdd,
+            \"score\": score,
+            \"max_score\": Scorer.MAX_SCORE,
+            \"cycles\": self.MAX_CYCLES,
+            \"validation\": validation,
+            \"breakdown\": Scorer.breakdown(sdd),
+            \"warning\": \"Score abaixo do threshold após todos os ciclos. Revisão manual recomendada.\",
+        })
