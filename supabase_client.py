@@ -1,3 +1,7 @@
+# supabase_client.py — FormalizeAI v4.1
+# FIX: save_project agora usa upsert atômico para mensagens,
+#      eliminando o risco de perda de histórico em caso de falha entre delete e insert.
+
 import json
 import logging
 from datetime import datetime
@@ -15,6 +19,7 @@ try:
 except ImportError:
     pass
 
+
 def get_supabase():
     global _supabase_instance
     if _supabase_instance is not None:
@@ -29,20 +34,37 @@ def get_supabase():
         log.warning(f"Falha ao conectar Supabase: {e}")
         return None
 
+
 def _local_path(project_name: str) -> Path:
     return PROJECTS_DIR / f"{project_name}.json"
+
 
 def load_project(project_name: str) -> dict:
     sb = get_supabase()
     if sb:
         try:
-            proj = sb.table("projects").select("id, name, model, status, created_at, updated_at").eq("name", project_name).maybe_single().execute()
+            proj = (
+                sb.table("projects")
+                .select("id, name, model, status, created_at, updated_at")
+                .eq("name", project_name)
+                .maybe_single()
+                .execute()
+            )
             if proj.data:
                 project_id = proj.data["id"]
-                msgs = sb.table("messages").select("role, content").eq("project_id", project_id).order("seq").execute()
+                msgs = (
+                    sb.table("messages")
+                    .select("role, content")
+                    .eq("project_id", project_id)
+                    .order("seq")
+                    .execute()
+                )
                 return {
                     "id": project_id,
-                    "messages": [{"role": m["role"], "content": m["content"]} for m in (msgs.data or [])],
+                    "messages": [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in (msgs.data or [])
+                    ],
                     "model": proj.data["model"],
                     "status": proj.data["status"],
                     "created": proj.data["created_at"],
@@ -69,6 +91,7 @@ def load_project(project_name: str) -> dict:
         "_source": "new",
     }
 
+
 def save_project(project_name: str, data: dict) -> None:
     sb = get_supabase()
     project_id = data.get("id")
@@ -76,6 +99,8 @@ def save_project(project_name: str, data: dict) -> None:
     if sb:
         try:
             messages = data.get("messages", [])
+
+            # Upsert do projeto (cria ou atualiza)
             if project_id:
                 sb.table("projects").update({
                     "model": data.get("model", DEFAULT_MODEL),
@@ -92,13 +117,39 @@ def save_project(project_name: str, data: dict) -> None:
                     project_id = result.data[0]["id"]
                     data["id"] = project_id
 
+            # FIX: upsert atômico de mensagens via seq como chave de conflito.
+            # A versão anterior fazia delete + insert em duas operações separadas:
+            # se o insert falhasse após o delete, o histórico era perdido permanentemente.
+            # Agora usamos upsert com on_conflict em (project_id, seq):
+            # - Mensagens existentes são atualizadas (role/content podem mudar)
+            # - Novas mensagens são inseridas
+            # - O histórico nunca fica em estado inconsistente
+            # IMPORTANTE: a tabela "messages" deve ter uma constraint UNIQUE(project_id, seq)
             if project_id and messages:
-                rows = [{"project_id": project_id, "role": m["role"], "content": m["content"], "seq": i} for i, m in enumerate(messages)]
-                sb.table("messages").delete().eq("project_id", project_id).execute()
-                sb.table("messages").insert(rows).execute()
+                rows = [
+                    {
+                        "project_id": project_id,
+                        "role": m["role"],
+                        "content": m["content"],
+                        "seq": i,
+                    }
+                    for i, m in enumerate(messages)
+                ]
+                (
+                    sb.table("messages")
+                    .upsert(rows, on_conflict="project_id,seq")
+                    .execute()
+                )
+
+                # Remove mensagens órfãs se o histórico foi truncado
+                # (ex: histórico reduzido de 20 para 15 mensagens)
+                max_seq = len(messages) - 1
+                sb.table("messages").delete().eq("project_id", project_id).gt("seq", max_seq).execute()
+
         except Exception as e:
             log.warning(f"save_project Supabase falhou: {e}")
 
+    # Persistência local como fallback
     local = _local_path(project_name)
     try:
         with open(local, "w", encoding="utf-8") as f:
@@ -107,13 +158,21 @@ def save_project(project_name: str, data: dict) -> None:
     except Exception as e:
         log.error(f"Erro ao salvar local {local}: {e}")
 
+
 def save_sdd(project_name: str, sdd_content: str, data: dict) -> str:
     sb = get_supabase()
     project_id = data.get("id")
 
     if sb and project_id:
         try:
-            result = sb.table("sdds").select("version").eq("project_id", project_id).order("version", desc=True).limit(1).execute()
+            result = (
+                sb.table("sdds")
+                .select("version")
+                .eq("project_id", project_id)
+                .order("version", desc=True)
+                .limit(1)
+                .execute()
+            )
             next_version = (result.data[0]["version"] + 1) if result.data else 1
             sb.table("sdds").insert({
                 "project_id": project_id,
@@ -131,4 +190,5 @@ def save_sdd(project_name: str, sdd_content: str, data: dict) -> str:
             f.write(sdd_content)
     except OSError as e:
         log.error(f"Falha ao salvar SDD local {md_file}: {e}")
+
     return str(md_file)
